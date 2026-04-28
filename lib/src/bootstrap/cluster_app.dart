@@ -465,7 +465,15 @@ class ClusterApp {
       });
     }
 
-    runApp(surface.builder());
+    // Build the widget tree, optionally wrapping with shrink-to-content.
+    Widget app = surface.builder();
+    if (surface.shrinkToContent) {
+      app = _ShrinkToContentWrapper(
+        maxSize: surface.size,
+        child: app,
+      );
+    }
+    runApp(app);
   }
 
   // ---------------------------------------------------------------------------
@@ -540,4 +548,94 @@ class ClusterScope extends InheritedWidget {
   @override
   bool updateShouldNotify(ClusterScope oldWidget) =>
       controllers != oldWidget.controllers;
+}
+
+/// Wrapper that measures the child's rendered size after the first frame
+/// and resizes the OS window to fit.
+///
+/// [maxSize] constrains the maximum window dimensions. The child is laid
+/// out inside an `Align` so it can report its natural (intrinsic) size
+/// instead of being forced to fill the available space.
+class _ShrinkToContentWrapper extends StatefulWidget {
+  final Size maxSize;
+  final Widget child;
+
+  const _ShrinkToContentWrapper({
+    required this.maxSize,
+    required this.child,
+  });
+
+  @override
+  State<_ShrinkToContentWrapper> createState() =>
+      _ShrinkToContentWrapperState();
+}
+
+class _ShrinkToContentWrapperState extends State<_ShrinkToContentWrapper> {
+  final GlobalKey _contentKey = GlobalKey();
+  bool _didShrink = false;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) => _measureAndShrink());
+  }
+
+  Future<void> _measureAndShrink() async {
+    if (_didShrink) return;
+    _didShrink = true;
+
+    final renderBox =
+        _contentKey.currentContext?.findRenderObject() as RenderBox?;
+    if (renderBox == null || !renderBox.hasSize) return;
+
+    final contentSize = renderBox.size;
+
+    // Clamp to maxSize.
+    final newWidth = widget.maxSize.width > 0
+        ? contentSize.width.clamp(0.0, widget.maxSize.width)
+        : contentSize.width;
+    final newHeight = widget.maxSize.height > 0
+        ? contentSize.height.clamp(0.0, widget.maxSize.height)
+        : contentSize.height;
+
+    // Only resize if content is actually smaller than current window.
+    try {
+      final hwnd = await _nativeCh.invokeMethod<int>('getWindowHwnd') ?? 0;
+      if (hwnd == 0) return;
+
+      // Get DPI scale.
+      final dpi = await _nativeCh.invokeMethod<double>('getDpiScale') ?? 1.0;
+      final physW = (newWidth * dpi).round();
+      final physH = (newHeight * dpi).round();
+
+      await _nativeCh.invokeMethod('setWindowSize', {
+        'handle': hwnd,
+        'width': physW,
+        'height': physH,
+      });
+
+      debugPrint(
+        '[Cluster] Shrink-to-content: '
+        '${contentSize.width.round()}×${contentSize.height.round()} → '
+        '${physW}×$physH (dpi=$dpi)',
+      );
+    } catch (e) {
+      debugPrint('[Cluster] Shrink-to-content failed: $e');
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Stack(
+      children: [
+        Align(
+          alignment: Alignment.topLeft,
+          child: KeyedSubtree(
+            key: _contentKey,
+            child: widget.child,
+          ),
+        ),
+      ],
+    );
+  }
 }

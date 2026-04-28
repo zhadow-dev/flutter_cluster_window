@@ -38,6 +38,13 @@ class ClusterSurface {
   /// When `false`, the overlay appears alongside the cluster.
   final bool hideClusterOnShow;
 
+  /// When `true`, the window shrinks to fit its content size after the
+  /// first frame.  The [size] field acts as the **maximum** constraint.
+  ///
+  /// Useful for toolbars, status bars, or overlays whose height/width
+  /// depends on content rather than a fixed value.
+  final bool shrinkToContent;
+
   const ClusterSurface({
     required this.id,
     required this.role,
@@ -46,6 +53,7 @@ class ClusterSurface {
     this.frameless = true,
     this.acrylicEffect = AcrylicEffect.none,
     this.hideClusterOnShow = true,
+    this.shrinkToContent = false,
     required this.builder,
   });
 
@@ -61,6 +69,7 @@ class ClusterSurface {
         'anchor': anchor?.toJson(),
         'frameless': frameless,
         'acrylicEffect': acrylicEffect.name,
+        'shrinkToContent': shrinkToContent,
       };
 
   /// Encodes this surface's configuration as a JSON string for
@@ -83,6 +92,7 @@ class ClusterSurface {
       frameless: map['frameless'] as bool? ?? true,
       acrylicEffect: AcrylicEffect.values.byName(
           map['acrylicEffect'] as String? ?? 'none'),
+      shrinkToContent: map['shrinkToContent'] as bool? ?? false,
       builder: builder,
     );
   }
