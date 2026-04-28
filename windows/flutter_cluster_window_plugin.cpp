@@ -180,6 +180,52 @@ void FlutterClusterWindowPlugin::HandleMethodCall(
         HWND top = GetAncestor(hwnd, GA_ROOT);
         result->Success(flutter::EncodableValue(
             static_cast<int64_t>(reinterpret_cast<intptr_t>(top ? top : hwnd))));
+    } else if (method == "getDpiScale") {
+        // Return the DPI scale factor for the current window.
+        HWND hwnd = registrar_->GetView()->GetNativeWindow();
+        HWND top = GetAncestor(hwnd, GA_ROOT);
+        HWND target = top ? top : hwnd;
+        UINT dpi = 96;
+        HMODULE user32 = GetModuleHandle(L"user32.dll");
+        if (user32) {
+            typedef UINT(WINAPI* GetDpiForWindowFunc)(HWND);
+            auto fn = (GetDpiForWindowFunc)GetProcAddress(user32, "GetDpiForWindow");
+            if (fn && target) dpi = fn(target);
+        }
+        double scale = dpi / 96.0;
+        result->Success(flutter::EncodableValue(scale));
+    } else if (method == "setWindowSize") {
+        // Resize a window by HWND without moving it.
+        if (args && std::holds_alternative<flutter::EncodableMap>(*args)) {
+            auto& map = std::get<flutter::EncodableMap>(*args);
+            HWND hwnd = HwndFromHandle(map);
+
+            int w = 0, h = 0;
+            auto wIt = map.find(flutter::EncodableValue("width"));
+            if (wIt != map.end()) {
+                if (std::holds_alternative<int32_t>(wIt->second))
+                    w = std::get<int32_t>(wIt->second);
+                else if (std::holds_alternative<int64_t>(wIt->second))
+                    w = static_cast<int>(std::get<int64_t>(wIt->second));
+            }
+            auto hIt = map.find(flutter::EncodableValue("height"));
+            if (hIt != map.end()) {
+                if (std::holds_alternative<int32_t>(hIt->second))
+                    h = std::get<int32_t>(hIt->second);
+                else if (std::holds_alternative<int64_t>(hIt->second))
+                    h = static_cast<int>(std::get<int64_t>(hIt->second));
+            }
+
+            if (IsWindow(hwnd) && w > 0 && h > 0) {
+                SetWindowPos(hwnd, nullptr, 0, 0, w, h,
+                    SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+                result->Success(flutter::EncodableValue(true));
+            } else {
+                result->Error("INVALID_ARGS", "Invalid handle or dimensions");
+            }
+        } else {
+            result->Error("INVALID_ARGS", "Expected EncodableMap");
+        }
     } else if (method == "setWindowPos") {
         // Direct SetWindowPos on any HWND — used by child windows to position themselves.
         if (args && std::holds_alternative<flutter::EncodableMap>(*args)) {

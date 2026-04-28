@@ -22,6 +22,7 @@ Treat multiple OS windows as a single, synchronized application — sidebars, ti
 - **Native DWM effects** — acrylic, mica, and transparent backdrop effects per window
 - **Frameless windows** — borderless OS windows with rounded corners
 - **Pre-built widgets** — drop-in `ClusterDragArea`, `ClusterWindowControls`, `ClusterOverlayButton` widgets
+- **Shrink to content** — optional per-window auto-sizing that measures widget content and shrinks the OS window to fit
 - **DPI-aware** — correct physical-pixel positioning across high-DPI displays
 
 ---
@@ -181,6 +182,36 @@ For anchored surfaces, only the **fixed dimension** matters:
 |--------|-------------|---------------|
 | `left` / `right` | Width | Height (matches primary) |
 | `top` / `bottom` | Height | Width (matches span) |
+
+### Shrink to content
+
+When `shrinkToContent: true` is set on a surface, the window measures its widget content after the first frame and resizes the OS window to fit. The `size` field acts as the **maximum constraint** — the window will never exceed it but can shrink smaller.
+
+```dart
+// A toolbar that shrinks to its actual button height:
+ClusterSurface(
+  id: 'toolbar',
+  role: SurfaceRole.chrome,
+  size: const Size(0, 60),       // max height = 60px
+  anchor: const SurfaceAnchor.top(gap: 2, span: SpanMode.full),
+  shrinkToContent: true,          // ← shrinks height to content
+  frameless: true,
+  builder: () => const ToolbarApp(),
+),
+
+// An overlay that wraps to its content size:
+ClusterSurface(
+  id: 'hud',
+  role: SurfaceRole.overlay,
+  size: const Size(400, 300),    // max size = 400×300
+  anchor: const SurfaceAnchor.absolute(Offset(50, 50)),
+  shrinkToContent: true,          // ← shrinks both dimensions
+  frameless: true,
+  builder: () => const HudApp(),
+),
+```
+
+> **How it works:** After the first frame, the wrapper measures the child `RenderBox` size, clamps it against `size`, and calls native `SetWindowPos` to resize the OS window. This happens once on initial render.
 
 ---
 
