@@ -408,6 +408,7 @@ void FlutterClusterWindowPlugin::HandleMethodCall(
             int backdropType = 0; // Auto
             if (effectType == "mica") backdropType = 2;
             else if (effectType == "acrylic") backdropType = 3;
+            else if (effectType == "tabbed") backdropType = 4;
             else if (effectType == "transparent") backdropType = 3;
             else if (effectType == "solid") backdropType = 1;
             else if (effectType == "none") backdropType = 1;
@@ -444,6 +445,107 @@ void FlutterClusterWindowPlugin::HandleMethodCall(
             HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
                 &cornerPref, sizeof(cornerPref));
             result->Success(flutter::EncodableValue(SUCCEEDED(hr)));
+        } else {
+            result->Error("INVALID_ARGS", "Expected EncodableMap");
+        }
+    } else if (method == "removeShadow") {
+        // Remove drop shadow from a window.
+        // Strips the CS_DROPSHADOW class style and disables DWM non-client
+        // rendering so no shadow is painted around the window frame.
+        if (args && std::holds_alternative<flutter::EncodableMap>(*args)) {
+            auto& map = std::get<flutter::EncodableMap>(*args);
+            HWND hwnd = HwndFromHandle(map);
+            if (IsWindow(hwnd)) {
+                // Remove CS_DROPSHADOW from the window class style.
+                ULONG_PTR classStyle = GetClassLongPtr(hwnd, GCL_STYLE);
+                SetClassLongPtr(hwnd, GCL_STYLE, classStyle & ~CS_DROPSHADOW);
+
+                // Disable DWM non-client rendering (removes DWM shadow).
+                #ifndef DWMWA_NCRENDERING_POLICY
+                #define DWMWA_NCRENDERING_POLICY 2
+                #endif
+                int ncrp = 1; // DWMNCRP_DISABLED
+                DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY,
+                    &ncrp, sizeof(ncrp));
+
+                // Reset DWM extended frame margins to zero.
+                // setDwmEffect sets {-1,-1,-1,-1} which creates a shadow;
+                // resetting to {0,0,0,0} removes it.  The backdrop type
+                // (DWMWA_SYSTEMBACKDROP_TYPE) still works independently
+                // on Windows 11 22H2+.
+                MARGINS margins = {0, 0, 0, 0};
+                DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+                // Defence-in-depth: also set WS_EX_TOOLWINDOW which
+                // prevents the OS from adding a shadow to this window.
+                LONG exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+                exStyle |= WS_EX_TOOLWINDOW;
+                SetWindowLong(hwnd, GWL_EXSTYLE, exStyle);
+
+                // Force the frame to repaint without shadow.
+                SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                    SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                    SWP_NOZORDER | SWP_NOACTIVATE);
+                result->Success(flutter::EncodableValue(true));
+            } else {
+                result->Error("INVALID_HANDLE", "Invalid HWND");
+            }
+        } else {
+            result->Error("INVALID_ARGS", "Expected EncodableMap");
+        }
+    } else if (method == "setZOrder") {
+        // Deterministic z-order control. Dart decides stacking;
+        // native just executes. No conditional logic.
+        // insertAfter: HWND to place this window above.
+        //              0 = HWND_BOTTOM.
+        if (args && std::holds_alternative<flutter::EncodableMap>(*args)) {
+            auto& map = std::get<flutter::EncodableMap>(*args);
+            HWND hwnd = HwndFromHandle(map);
+
+            auto iaIt = map.find(flutter::EncodableValue("insertAfter"));
+            HWND insertAfter = HWND_BOTTOM;
+            if (iaIt != map.end()) {
+                int64_t val = 0;
+                if (std::holds_alternative<int32_t>(iaIt->second))
+                    val = std::get<int32_t>(iaIt->second);
+                else if (std::holds_alternative<int64_t>(iaIt->second))
+                    val = std::get<int64_t>(iaIt->second);
+                if (val != 0)
+                    insertAfter = reinterpret_cast<HWND>(static_cast<intptr_t>(val));
+            }
+
+            if (IsWindow(hwnd)) {
+                SetWindowPos(hwnd, insertAfter, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                result->Success(flutter::EncodableValue(true));
+            } else {
+                result->Error("INVALID_HANDLE", "Invalid HWND");
+            }
+        } else {
+            result->Error("INVALID_ARGS", "Expected EncodableMap");
+        }
+    } else if (method == "setTopMost") {
+        // Explicit TOPMOST/NOTOPMOST control.
+        // Dart decides when a window should be topmost.
+        // topMost: true → HWND_TOPMOST, false → HWND_NOTOPMOST.
+        if (args && std::holds_alternative<flutter::EncodableMap>(*args)) {
+            auto& map = std::get<flutter::EncodableMap>(*args);
+            HWND hwnd = HwndFromHandle(map);
+
+            bool topMost = false;
+            auto tmIt = map.find(flutter::EncodableValue("topMost"));
+            if (tmIt != map.end() && std::holds_alternative<bool>(tmIt->second))
+                topMost = std::get<bool>(tmIt->second);
+
+            if (IsWindow(hwnd)) {
+                SetWindowPos(hwnd,
+                    topMost ? HWND_TOPMOST : HWND_NOTOPMOST,
+                    0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                result->Success(flutter::EncodableValue(true));
+            } else {
+                result->Error("INVALID_HANDLE", "Invalid HWND");
+            }
         } else {
             result->Error("INVALID_ARGS", "Expected EncodableMap");
         }
@@ -825,17 +927,28 @@ void FlutterClusterWindowPlugin::HandleMethodCall(
 
         if (IsWindowVisible(overlay)) {
             // HIDE overlay → RESTORE cluster (only if we hid it).
+
+            // Remove TOPMOST first so overlay doesn't stay above everything.
+            SetWindowPos(overlay, HWND_NOTOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
             ShowWindow(overlay, SW_HIDE);
 
             if (hideCluster) {
                 // Restore primary first, then show children.
                 if (primary && IsWindow(primary)) {
                     ShowWindow(primary, SW_RESTORE);
+                    // Restore focus to primary after overlay hide.
+                    SetForegroundWindow(primary);
                 }
                 for (HWND ch : clusterChildren) {
                     if (IsWindow(ch)) {
                         ShowWindow(ch, SW_SHOWNOACTIVATE);
                     }
+                }
+            } else {
+                // Even without hideCluster, restore focus to primary.
+                if (primary && IsWindow(primary)) {
+                    SetForegroundWindow(primary);
                 }
             }
         } else {

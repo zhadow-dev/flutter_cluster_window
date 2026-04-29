@@ -7,12 +7,19 @@ import 'package:flutter/services.dart';
 import 'package:flutter_acrylic/flutter_acrylic.dart' as acrylic;
 import 'package:window_manager/window_manager.dart';
 
+import '../core/cluster_visual_config.dart';
 import '../core/surface_role.dart';
+import '../core/surface_visual.dart';
 import '../layout/surface_anchor.dart';
 import 'cluster_surface.dart';
 
 /// Native bridge channel registered in all windows (primary and children).
 const _nativeCh = MethodChannel('flutter_cluster_window');
+
+/// Completer that the child boot sequence completes when the parent signals
+/// `parentReady`.  Used by [_ShrinkToContentWrapper] to delay its measurement
+/// until after the parent has positioned the window via `setWindowPos`.
+Completer<void>? _parentReadyCompleter;
 
 /// Bootstrap entry point that routes `main()` to the correct window.
 ///
@@ -23,15 +30,19 @@ class ClusterApp {
     required List<String> args,
     required String clusterId,
     required List<ClusterSurface> surfaces,
+    ClusterVisualConfig? visualConfig,
   }) {
     final primaries = surfaces.where((s) => s.isPrimary).toList();
     assert(primaries.length == 1,
         'Exactly one primary surface required. Found ${primaries.length}.');
 
+    final config = visualConfig ??
+        ClusterVisualConfig(shadowOwnerId: primaries.first.id);
+
     if (args.isNotEmpty) {
       _bootChild(args, surfaces);
     } else {
-      _bootPrimary(clusterId, surfaces);
+      _bootPrimary(clusterId, surfaces, config);
     }
   }
 
@@ -45,6 +56,7 @@ class ClusterApp {
   static void _bootPrimary(
     String clusterId,
     List<ClusterSurface> surfaces,
+    ClusterVisualConfig config,
   ) async {
     WidgetsFlutterBinding.ensureInitialized();
 
@@ -54,6 +66,12 @@ class ClusterApp {
 
     // Initialise window_manager.
     await windowManager.ensureInitialized();
+
+    // flutter_acrylic initialisation makes the Flutter rendering surface
+    // transparent. Without this, the engine paints opaque black under
+    // all widgets, hiding any DWM backdrop effect.
+    await acrylic.Window.initialize();
+
     final isRestart = _previousHwnds.isNotEmpty;
     await windowManager.waitUntilReadyToShow(
       WindowOptions(
@@ -64,14 +82,11 @@ class ClusterApp {
         titleBarStyle: primary.frameless ? TitleBarStyle.hidden : TitleBarStyle.normal,
       ),
       () async {
-        await windowManager.setHasShadow(false);
+        await windowManager.setHasShadow(primary.id == config.shadowOwnerId);
         await windowManager.show();
         await windowManager.focus();
       },
     );
-
-    // Apply acrylic effect on primary window.
-    await _applyEffect(primary.acrylicEffect);
 
     final controllers = <String, WindowController>{};
     final hwnds = <String, int>{};
@@ -79,6 +94,19 @@ class ClusterApp {
     // Retrieve the primary window's native handle.
     final primaryHwnd = await _nativeCh.invokeMethod<int>('getWindowHwnd') ?? 0;
     debugPrint('[Cluster] Primary HWND=$primaryHwnd');
+
+    // Apply backdrop effect on primary window via native DWM.
+    if (primary.visual.backdrop != BackdropType.none && primaryHwnd != 0) {
+      try {
+        await _nativeCh.invokeMethod('setDwmEffect', {
+          'handle': primaryHwnd,
+          'effect': primary.visual.backdrop.name,
+        });
+        debugPrint('[Cluster] Primary backdrop: ${primary.visual.backdrop.name}');
+      } catch (e) {
+        debugPrint('[Cluster] Primary backdrop failed: $e');
+      }
+    }
 
     await windowManager.restore();
     await windowManager.show();
@@ -250,24 +278,39 @@ class ClusterApp {
 
       controllers[child.id]!.show();
 
-      if (child.acrylicEffect != AcrylicEffect.none) {
+      // Apply backdrop effect via native DWM.
+      if (child.visual.backdrop != BackdropType.none) {
         try {
           await _nativeCh.invokeMethod('setDwmEffect', {
             'handle': hwnd,
-            'effect': child.acrylicEffect.name,
+            'effect': child.visual.backdrop.name,
           });
-          debugPrint('[Cluster] DWM effect ${child.acrylicEffect.name} applied to ${child.id}');
+          debugPrint('[Cluster][backdrop] ${child.visual.backdrop.name} → ${child.id}');
         } catch (e) {
-          debugPrint('[Cluster] DWM effect failed for ${child.id}: $e');
+          debugPrint('[Cluster][backdrop] Failed for ${child.id}: $e');
         }
       }
 
+      // Apply corner style.
       try {
         await _nativeCh.invokeMethod('setCornerPreference', {
           'handle': hwnd,
-          'preference': 'round',
+          'preference': child.visual.cornerStyle.name,
         });
       } catch (_) {}
+
+      // Shadow enforcement: only the shadow owner keeps its shadow.
+      // All other cluster surfaces have shadow forcefully removed.
+      // This is called AFTER DWM effect so the margin reset overrides
+      // the {-1,-1,-1,-1} margins that setDwmEffect applies.
+      if (child.id != config.shadowOwnerId) {
+        try {
+          await _nativeCh.invokeMethod('removeShadow', {'handle': hwnd});
+          debugPrint('[Cluster][shadow] Removed from ${child.id}');
+        } catch (e) {
+          debugPrint('[Cluster][shadow] Failed for ${child.id}: $e');
+        }
+      }
 
       try {
         await controllers[child.id]!.invokeMethod('parentReady');
@@ -282,8 +325,33 @@ class ClusterApp {
       if (child.frameless) {
         await _nativeCh.invokeMethod('setFrameless', {'handle': hwnd});
       }
+      // Overlay shadow: controlled by config, not per-surface.
+      if (!config.allowOverlayShadow) {
+        try {
+          await _nativeCh.invokeMethod('removeShadow', {'handle': hwnd});
+        } catch (_) {}
+      }
       await _nativeCh.invokeMethod('setToolWindow', {'handle': hwnd});
     }
+
+    // ── Initial cluster reconciliation (boot) ──────────────────
+    _clearShadowCache(); // Clear on restart / hot reload.
+    final bootV = ++_version;
+    await _reconcileZOrder(
+      primaryHwnd: primaryHwnd,
+      children: children,
+      hwnds: hwnds,
+      version: bootV,
+    );
+    await _enforceShadowPolicy(
+      config: config,
+      primary: primary,
+      children: children,
+      primaryHwnd: primaryHwnd,
+      hwnds: hwnds,
+      version: bootV,
+    );
+    debugPrint('[Cluster][v$bootV][boot] Initial reconcile complete');
 
     // Install a native move hook so children follow the primary window.
     await _nativeCh.invokeMethod('installMoveHook', {'handle': primaryHwnd});
@@ -323,16 +391,65 @@ class ClusterApp {
             topReservation: topReservation,
             bottomReservation: bottomReservation,
           );
-          await _nativeCh.invokeMethod('setWindowPos', {
-            'handle': hwnd,
-            'frame': {
-              'x': bounds.left.toInt(),
-              'y': bounds.top.toInt(),
-              'w': bounds.width.toInt(),
-              'h': bounds.height.toInt(),
-            },
-          });
+
+          if (child.shrinkToContent) {
+            // Only update position; preserve the content-driven size.
+            final currentRect = await _nativeCh
+                .invokeMethod<Map<dynamic, dynamic>>(
+                    'getPhysicalRect', {'handle': hwnd});
+            final curW = (currentRect?['w'] as int?) ?? bounds.width.toInt();
+            final curH = (currentRect?['h'] as int?) ?? bounds.height.toInt();
+
+            // Apply content alignment offset relative to primary.
+            int finalY = bounds.top.toInt();
+            if (child.contentAlignment != null) {
+              final alignFactor = (child.contentAlignment!.y + 1) / 2;
+              finalY = (newBounds.top + (newBounds.height - curH) * alignFactor).toInt();
+            }
+
+            await _nativeCh.invokeMethod('setWindowPos', {
+              'handle': hwnd,
+              'frame': {
+                'x': bounds.left.toInt(),
+                'y': finalY,
+                'w': curW,
+                'h': curH,
+              },
+            });
+          } else {
+            await _nativeCh.invokeMethod('setWindowPos', {
+              'handle': hwnd,
+              'frame': {
+                'x': bounds.left.toInt(),
+                'y': bounds.top.toInt(),
+                'w': bounds.width.toInt(),
+                'h': bounds.height.toInt(),
+              },
+            });
+          }
         }
+
+        // Pipeline: Position (above) → Z-order → Shadow enforce.
+        _requestClusterReconcile(
+          primaryHwnd: primaryHwnd,
+          children: children,
+          hwnds: hwnds,
+          config: config,
+          primary: primary,
+        );
+      }
+
+      // When any cluster window gains focus (taskbar click, Alt+Tab,
+      // child window click), reassert the z-order stack so children
+      // stay above primary and nothing drops behind.
+      if (type == 'WINDOW_FOCUSED') {
+        _requestClusterReconcile(
+          primaryHwnd: primaryHwnd,
+          children: children,
+          hwnds: hwnds,
+          config: config,
+          primary: primary,
+        );
       }
     });
 
@@ -357,10 +474,32 @@ class ClusterApp {
         'clusterHandles': clusterHwnds,
         'hideCluster': overlayConfig?.hideClusterOnShow ?? true,
       });
+      // Overlay shadow policy (independent).
+      _requestOverlayReconcile(
+        overlays: overlays,
+        hwnds: hwnds,
+        config: config,
+      );
+      // Cluster z-order may be corrupted after minimize/restore cycle.
+      _requestClusterReconcile(
+        primaryHwnd: primaryHwnd,
+        children: children,
+        hwnds: hwnds,
+        config: config,
+        primary: primary,
+      );
     }
 
     Future<void> doDrag(Map<dynamic, dynamic>? args) async {
       await _nativeCh.invokeMethod('dragPrimaryWindow', args);
+      // OS reorders windows during drag. Reassert z-order immediately.
+      _requestClusterReconcile(
+        primaryHwnd: primaryHwnd,
+        children: children,
+        hwnds: hwnds,
+        config: config,
+        primary: primary,
+      );
     }
 
     await cmdChannel.setMethodCallHandler((call) async {
@@ -380,6 +519,10 @@ class ClusterApp {
           return null;
         case 'clusterOverlay':
           await doToggleOverlay();
+          return null;
+        case 'navigate':
+          final index = call.arguments as int? ?? 0;
+          ClusterScope.onNavigate?.call(index);
           return null;
         default:
           return null;
@@ -408,6 +551,11 @@ class ClusterApp {
     List<ClusterSurface> surfaces,
   ) async {
     WidgetsFlutterBinding.ensureInitialized();
+
+    // Make the child's rendering surface transparent for DWM backdrop.
+    try {
+      await acrylic.Window.initialize();
+    } catch (_) {}
 
     WindowController? controller;
     ClusterSurface? surface;
@@ -438,6 +586,11 @@ class ClusterApp {
 
     final readyCompleter = Completer<void>();
     final surfaceId = surface.id;
+
+    // Expose the completer to the shrink-to-content wrapper.
+    if (surface.shrinkToContent) {
+      _parentReadyCompleter = readyCompleter;
+    }
 
     if (controller != null) {
       await controller.setWindowMethodHandler((call) async {
@@ -470,6 +623,7 @@ class ClusterApp {
     if (surface.shrinkToContent) {
       app = _ShrinkToContentWrapper(
         maxSize: surface.size,
+        contentAlignment: surface.contentAlignment,
         child: app,
       );
     }
@@ -477,40 +631,163 @@ class ClusterApp {
   }
 
   // ---------------------------------------------------------------------------
-  // Helpers
+  // Orchestrator — single pipeline, serialized, debounced
   // ---------------------------------------------------------------------------
 
-  /// Applies a DWM backdrop effect (acrylic, mica, etc.) to the primary window.
-  static Future<void> _applyEffect(AcrylicEffect effect) async {
-    try {
-      await acrylic.Window.initialize();
-      await acrylic.Window.setEffect(
-        effect: _mapEffect(effect),
-        color: effect == AcrylicEffect.solid
-            ? const Color(0xFF161B22)
-            : Colors.transparent,
-        dark: true,
-      );
-      debugPrint('[Cluster] Effect applied: ${effect.name}');
-    } catch (e) {
-      debugPrint('[Cluster] Effect failed: $e');
+  /// Pipeline version counter for structured log tracing.
+  static int _version = 0;
+
+  /// Serialization lock. Only one reconcile pipeline runs at a time.
+  static Future<void> _pipelineLock = Future.value();
+
+  /// Debounce timer. Collapses event bursts into one execution.
+  /// scheduleMicrotask is too eager — platform channel messages arrive
+  /// on separate event loop ticks. A 16ms timer (~1 frame) properly
+  /// coalesces drag events (60 events/sec → 1 reconcile).
+  static Timer? _reconcileTimer;
+
+  /// Idempotent shadow cache keyed by HWND (not surface ID).
+  /// Tracks actual OS state. Cleared on window recreate / cluster restart.
+  static final Set<int> _shadowDisabledHandles = {};
+
+  /// Clears the shadow cache. Call on window recreate or cluster restart.
+  static void _clearShadowCache() => _shadowDisabledHandles.clear();
+
+  /// Schedules a cluster reconciliation (debounced, serialized).
+  ///
+  /// Call from any cluster trigger (move, resize, focus).
+  /// Never call [_reconcileZOrder] or [_enforceShadowPolicy] directly.
+  /// Overlays do NOT trigger this — they use [_requestOverlayReconcile].
+  static void _requestClusterReconcile({
+    required int primaryHwnd,
+    required List<ClusterSurface> children,
+    required Map<String, int> hwnds,
+    required ClusterVisualConfig config,
+    required ClusterSurface primary,
+  }) {
+    _reconcileTimer?.cancel();
+    _reconcileTimer = Timer(const Duration(milliseconds: 16), () {
+      _pipelineLock = _pipelineLock.then((_) async {
+        final v = ++_version;
+        try {
+          await _reconcileZOrder(
+            primaryHwnd: primaryHwnd,
+            children: children,
+            hwnds: hwnds,
+            version: v,
+          );
+          await _enforceShadowPolicy(
+            config: config,
+            primary: primary,
+            children: children,
+            primaryHwnd: primaryHwnd,
+            hwnds: hwnds,
+            version: v,
+          );
+          debugPrint('[Cluster][v$v][reconcile] Complete');
+        } catch (e) {
+          debugPrint('[Cluster][v$v][ERROR] Reconcile failed: $e');
+        }
+      });
+    });
+  }
+
+  /// Overlay-specific reconciliation. Independent from cluster z-order.
+  static void _requestOverlayReconcile({
+    required List<ClusterSurface> overlays,
+    required Map<String, int> hwnds,
+    required ClusterVisualConfig config,
+  }) {
+    _pipelineLock = _pipelineLock.then((_) async {
+      final v = ++_version;
+      if (!config.allowOverlayShadow) {
+        for (final overlay in overlays) {
+          final hwnd = hwnds[overlay.id];
+          if (hwnd == null || _shadowDisabledHandles.contains(hwnd)) continue;
+          try {
+            await _nativeCh.invokeMethod('removeShadow', {'handle': hwnd});
+            _shadowDisabledHandles.add(hwnd);
+            debugPrint('[Cluster][v$v][shadow] Overlay ${overlay.id} removed');
+          } catch (e) {
+            debugPrint('[Cluster][v$v][ERROR] Overlay shadow: $e');
+          }
+        }
+      }
+    });
+  }
+
+  /// Rebuilds the cluster z-order stack relative to the primary window.
+  ///
+  /// PURE — only setZOrder calls. No side effects.
+  /// Does NOT touch the primary's global z-position (that's OS-managed).
+  /// Children are stacked above primary in layer order.
+  static Future<void> _reconcileZOrder({
+    required int primaryHwnd,
+    required List<ClusterSurface> children,
+    required Map<String, int> hwnds,
+    required int version,
+  }) async {
+    // Sort by layer ascending: base → panel → chrome.
+    final ordered = children
+        .where((c) => hwnds.containsKey(c.id))
+        .toList()
+      ..sort((a, b) => a.visual.layer.compareTo(b.visual.layer));
+
+    // Stack each child above the previous one, starting from primary.
+    // Primary keeps its global z-position — we only control relative
+    // ordering within the cluster.
+    for (int i = 0; i < ordered.length; i++) {
+      final hwnd = hwnds[ordered[i].id];
+      if (hwnd == null) continue;
+
+      final insertAfter = i == 0
+          ? primaryHwnd
+          : hwnds[ordered[i - 1].id] ?? primaryHwnd;
+
+      try {
+        await _nativeCh.invokeMethod('setZOrder', {
+          'handle': hwnd,
+          'insertAfter': insertAfter,
+        });
+        debugPrint('[Cluster][v$version][zorder] ${ordered[i].id} → ${ordered[i].visual.layer.name}');
+      } catch (e) {
+        debugPrint('[Cluster][v$version][zorder] Failed ${ordered[i].id}: $e');
+      }
     }
   }
 
-  /// Maps the plugin's [AcrylicEffect] enum to the `flutter_acrylic` enum.
-  static acrylic.WindowEffect _mapEffect(AcrylicEffect effect) {
-    return switch (effect) {
-      AcrylicEffect.acrylic => acrylic.WindowEffect.acrylic,
-      AcrylicEffect.mica => acrylic.WindowEffect.mica,
-      AcrylicEffect.transparent => acrylic.WindowEffect.transparent,
-      AcrylicEffect.solid => acrylic.WindowEffect.solid,
-      AcrylicEffect.none => acrylic.WindowEffect.disabled,
-    };
+  /// Enforces shadow ownership. Idempotent — keyed by HWND.
+  /// Only touches cluster surfaces. Overlays handled separately.
+  static Future<void> _enforceShadowPolicy({
+    required ClusterVisualConfig config,
+    required ClusterSurface primary,
+    required List<ClusterSurface> children,
+    required int primaryHwnd,
+    required Map<String, int> hwnds,
+    required int version,
+  }) async {
+    if (primary.id != config.shadowOwnerId &&
+        !_shadowDisabledHandles.contains(primaryHwnd)) {
+      try {
+        await windowManager.setHasShadow(false);
+        _shadowDisabledHandles.add(primaryHwnd);
+        debugPrint('[Cluster][v$version][shadow] Primary disabled');
+      } catch (_) {}
+    }
+
+    for (final child in children) {
+      if (child.id == config.shadowOwnerId) continue;
+      final hwnd = hwnds[child.id];
+      if (hwnd == null || _shadowDisabledHandles.contains(hwnd)) continue;
+
+      try {
+        await _nativeCh.invokeMethod('removeShadow', {'handle': hwnd});
+        _shadowDisabledHandles.add(hwnd);
+        debugPrint('[Cluster][v$version][shadow] Enforced on ${child.id}');
+      } catch (_) {}
+    }
   }
 }
-
-/// Visual backdrop effect applied to a window via DWM.
-enum AcrylicEffect { acrylic, mica, transparent, solid, none }
 
 /// [InheritedWidget] that provides cluster context to descendant widgets.
 ///
@@ -524,6 +801,9 @@ class ClusterScope extends InheritedWidget {
 
   /// Callback for toggling the overlay, set during the boot sequence.
   static Future<void> Function()? onToggleOverlay;
+
+  /// Callback for navigation commands from child windows.
+  static void Function(int index)? onNavigate;
 
   const ClusterScope({
     super.key,
@@ -558,10 +838,12 @@ class ClusterScope extends InheritedWidget {
 /// instead of being forced to fill the available space.
 class _ShrinkToContentWrapper extends StatefulWidget {
   final Size maxSize;
+  final Alignment? contentAlignment;
   final Widget child;
 
   const _ShrinkToContentWrapper({
     required this.maxSize,
+    this.contentAlignment,
     required this.child,
   });
 
@@ -577,7 +859,27 @@ class _ShrinkToContentWrapperState extends State<_ShrinkToContentWrapper> {
   @override
   void initState() {
     super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _measureAndShrink());
+    // Wait for the parent to position us via setWindowPos, then shrink.
+    if (_parentReadyCompleter != null) {
+      _parentReadyCompleter!.future.then((_) {
+        // Small delay so the parent's setWindowPos settles.
+        Future.delayed(const Duration(milliseconds: 200), () {
+          if (mounted) {
+            WidgetsBinding.instance
+                .addPostFrameCallback((_) => _measureAndShrink());
+          }
+        });
+      }).timeout(const Duration(seconds: 5), onTimeout: () {
+        // Fallback: shrink even if parentReady never arrived.
+        if (mounted && !_didShrink) {
+          WidgetsBinding.instance
+              .addPostFrameCallback((_) => _measureAndShrink());
+        }
+      });
+    } else {
+      WidgetsBinding.instance
+          .addPostFrameCallback((_) => _measureAndShrink());
+    }
   }
 
   Future<void> _measureAndShrink() async {
@@ -590,13 +892,17 @@ class _ShrinkToContentWrapperState extends State<_ShrinkToContentWrapper> {
 
     final contentSize = renderBox.size;
 
+    // Add a small buffer to prevent sub-pixel overflow from DPI rounding.
+    final bufferedWidth = contentSize.width + 2;
+    final bufferedHeight = contentSize.height + 2;
+
     // Clamp to maxSize.
     final newWidth = widget.maxSize.width > 0
-        ? contentSize.width.clamp(0.0, widget.maxSize.width)
-        : contentSize.width;
+        ? bufferedWidth.clamp(0.0, widget.maxSize.width)
+        : bufferedWidth;
     final newHeight = widget.maxSize.height > 0
-        ? contentSize.height.clamp(0.0, widget.maxSize.height)
-        : contentSize.height;
+        ? bufferedHeight.clamp(0.0, widget.maxSize.height)
+        : bufferedHeight;
 
     // Only resize if content is actually smaller than current window.
     try {
@@ -614,6 +920,33 @@ class _ShrinkToContentWrapperState extends State<_ShrinkToContentWrapper> {
         'height': physH,
       });
 
+      // Reposition based on contentAlignment if specified.
+      if (widget.contentAlignment != null) {
+        try {
+          // Get the primary window's HWND by finding the runner window.
+          final currentRect = await _nativeCh
+              .invokeMethod<Map<dynamic, dynamic>>(
+                  'getPhysicalRect', {'handle': hwnd});
+          if (currentRect != null) {
+            final curX = (currentRect['x'] as int?) ?? 0;
+            final curY = (currentRect['y'] as int?) ?? 0;
+            // Keep X, apply vertical alignment relative to the window height
+            // (the parent will reposition us on subsequent moves).
+            await _nativeCh.invokeMethod('setWindowPos', {
+              'handle': hwnd,
+              'frame': {
+                'x': curX,
+                'y': curY,
+                'w': physW,
+                'h': physH,
+              },
+            });
+          }
+        } catch (e) {
+          debugPrint('[Cluster] Content alignment reposition failed: $e');
+        }
+      }
+
       debugPrint(
         '[Cluster] Shrink-to-content: '
         '${contentSize.width.round()}×${contentSize.height.round()} → '
@@ -626,7 +959,9 @@ class _ShrinkToContentWrapperState extends State<_ShrinkToContentWrapper> {
 
   @override
   Widget build(BuildContext context) {
-    return Stack(
+    return Directionality(
+      textDirection: TextDirection.ltr,
+      child: Stack(
       children: [
         Align(
           alignment: Alignment.topLeft,
@@ -636,6 +971,7 @@ class _ShrinkToContentWrapperState extends State<_ShrinkToContentWrapper> {
           ),
         ),
       ],
+    ),
     );
   }
 }
