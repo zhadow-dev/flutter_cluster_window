@@ -38,8 +38,10 @@ export 'src/bootstrap/cluster_surface.dart';
 // Core
 export 'src/cluster_controller.dart';
 export 'src/core/cluster_state.dart';
+export 'src/core/cluster_visual_config.dart';
 export 'src/core/surface_state.dart';
 export 'src/core/surface_role.dart';
+export 'src/core/surface_visual.dart';
 export 'src/core/commands.dart';
 export 'src/core/events.dart';
 export 'src/core/drag_state.dart' show DragState, ClusterLock;

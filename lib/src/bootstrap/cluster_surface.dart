@@ -1,14 +1,14 @@
 import 'dart:convert';
 
-import 'package:flutter/widgets.dart';
+import 'package:flutter/material.dart';
 
 import '../core/surface_role.dart';
+import '../core/surface_visual.dart';
 import '../layout/surface_anchor.dart';
-import 'cluster_app.dart';
 
 /// Declarative definition of a single surface (OS window) in the cluster.
 ///
-/// Each surface describes its layout, visual style, and the widget tree
+/// Each surface describes its layout, visual contract, and the widget tree
 /// to render inside the window.
 class ClusterSurface {
   /// Unique identifier for this surface within the cluster.
@@ -28,8 +28,12 @@ class ClusterSurface {
   /// Whether the window should have no OS-drawn title bar or border.
   final bool frameless;
 
-  /// DWM backdrop effect (acrylic, mica, etc.) applied to this window.
-  final AcrylicEffect acrylicEffect;
+  /// Visual rendering contract for this surface.
+  ///
+  /// Controls backdrop effect, stacking layer, and corner style.
+  /// Shadow is NOT here — it is a cluster-level decision managed by
+  /// [ClusterVisualConfig].
+  final SurfaceVisual visual;
 
   /// Factory that builds the widget tree rendered inside this window.
   final Widget Function() builder;
@@ -45,17 +49,27 @@ class ClusterSurface {
   /// depends on content rather than a fixed value.
   final bool shrinkToContent;
 
-  const ClusterSurface({
+  /// Alignment of this surface relative to the primary surface after
+  /// shrink-to-content resizing.
+  ///
+  /// Only meaningful when [shrinkToContent] is `true`.  For example,
+  /// `Alignment.center` centres a right-anchored panel vertically
+  /// against the primary window.  When `null`, the window keeps its
+  /// default anchor-computed position (top-aligned).
+  final Alignment? contentAlignment;
+
+  ClusterSurface({
     required this.id,
     required this.role,
     required this.size,
     this.anchor,
     this.frameless = true,
-    this.acrylicEffect = AcrylicEffect.none,
+    SurfaceVisual? visual,
     this.hideClusterOnShow = true,
     this.shrinkToContent = false,
+    this.contentAlignment,
     required this.builder,
-  });
+  }) : visual = visual ?? SurfaceVisual.forRole(role);
 
   /// Whether this surface has the [SurfaceRole.primary] role.
   bool get isPrimary => role == SurfaceRole.primary;
@@ -68,8 +82,10 @@ class ClusterSurface {
         'height': size.height,
         'anchor': anchor?.toJson(),
         'frameless': frameless,
-        'acrylicEffect': acrylicEffect.name,
+        'visual': visual.toJson(),
         'shrinkToContent': shrinkToContent,
+        'contentAlignmentX': contentAlignment?.x,
+        'contentAlignmentY': contentAlignment?.y,
       };
 
   /// Encodes this surface's configuration as a JSON string for
@@ -79,6 +95,15 @@ class ClusterSurface {
   /// Decodes a [ClusterSurface] from a JSON string and a [builder] callback.
   static ClusterSurface decode(String json, Widget Function() builder) {
     final map = jsonDecode(json) as Map<String, dynamic>;
+    final alignX = (map['contentAlignmentX'] as num?)?.toDouble();
+    final alignY = (map['contentAlignmentY'] as num?)?.toDouble();
+
+    // Decode visual from nested map, or fall back to role-based default.
+    SurfaceVisual? visual;
+    if (map['visual'] != null) {
+      visual = SurfaceVisual.fromJson(map['visual'] as Map<String, dynamic>);
+    }
+
     return ClusterSurface(
       id: map['id'] as String,
       role: SurfaceRole.values.byName(map['role'] as String),
@@ -90,9 +115,11 @@ class ClusterSurface {
           ? SurfaceAnchor.fromJson(map['anchor'] as Map<String, dynamic>)
           : null,
       frameless: map['frameless'] as bool? ?? true,
-      acrylicEffect: AcrylicEffect.values.byName(
-          map['acrylicEffect'] as String? ?? 'none'),
+      visual: visual,
       shrinkToContent: map['shrinkToContent'] as bool? ?? false,
+      contentAlignment: alignX != null && alignY != null
+          ? Alignment(alignX, alignY)
+          : null,
       builder: builder,
     );
   }
