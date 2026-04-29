@@ -41,8 +41,11 @@ class _SidebarWindowAppState extends State<SidebarWindowApp> {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
-        brightness: Brightness.light,
+        brightness: Brightness.dark,
         fontFamily: 'Segoe UI',
+        scaffoldBackgroundColor: Colors.transparent,
+        canvasColor: Colors.transparent,
+        colorScheme: ColorScheme.dark(surface: Colors.transparent),
       ),
       home: Scaffold(
         backgroundColor: Colors.transparent,
@@ -93,10 +96,10 @@ class _NavButtonState extends State<_NavButton> {
   Widget build(BuildContext context) {
     final isActive = widget.selected;
     final color = isActive
-        ? const Color(0xFF1A1A2E)
+        ? Colors.white
         : _hovered
-            ? const Color(0xFF3A3A4E)
-            : const Color(0xFF6E6E82);
+            ? Colors.white70
+            : Colors.white54;
 
     return MouseRegion(
       onEnter: (_) => setState(() => _hovered = true),

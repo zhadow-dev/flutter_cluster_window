@@ -14,8 +14,11 @@ class TitleBarWindowApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
-        brightness: Brightness.light,
+        brightness: Brightness.dark,
         fontFamily: 'Segoe UI',
+        scaffoldBackgroundColor: Colors.transparent,
+        canvasColor: Colors.transparent,
+        colorScheme: ColorScheme.dark(surface: Colors.transparent),
       ),
       home: Scaffold(
         backgroundColor: Colors.transparent,
@@ -27,7 +30,7 @@ class TitleBarWindowApp extends StatelessWidget {
               const Expanded(child: ClusterDragArea(height: 40)),
               // Window controls — minimize, maximize/restore, close.
               const ClusterWindowControls(
-                color: Color(0xFF4A4A5E),
+                color: Colors.white70,
               ),
             ],
           ),

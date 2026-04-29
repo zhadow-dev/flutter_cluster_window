@@ -13,8 +13,11 @@ class OverlayWindowApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
-        brightness: Brightness.light,
+        brightness: Brightness.dark,
         fontFamily: 'Segoe UI',
+        scaffoldBackgroundColor: Colors.transparent,
+        canvasColor: Colors.transparent,
+        colorScheme: ColorScheme.dark(surface: Colors.transparent),
       ),
       home: Scaffold(
         backgroundColor: Colors.transparent,
@@ -26,12 +29,12 @@ class OverlayWindowApp extends StatelessWidget {
               child: Row(
                 children: [
                   const Icon(Icons.picture_in_picture_alt,
-                      size: 14, color: Color(0xFF4A4A5E)),
+                      size: 14, color: Colors.white70),
                   const SizedBox(width: 6),
                   const Text(
                     'Overlay',
                     style: TextStyle(
-                      color: Color(0xFF3A3A4E),
+                      color: Colors.white,
                       fontSize: 12,
                       fontWeight: FontWeight.w600,
                     ),
@@ -46,7 +49,7 @@ class OverlayWindowApp extends StatelessWidget {
                 child: Text(
                   'Floating Window',
                   style: TextStyle(
-                    color: Color(0xFF4A4A5E),
+                    color: Colors.white70,
                     fontSize: 13,
                   ),
                 ),

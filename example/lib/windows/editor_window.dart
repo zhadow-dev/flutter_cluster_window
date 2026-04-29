@@ -11,8 +11,13 @@ class EditorWindowApp extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         useMaterial3: true,
-        brightness: Brightness.light,
+        brightness: Brightness.dark,
         fontFamily: 'Segoe UI',
+        scaffoldBackgroundColor: Colors.transparent,
+        canvasColor: Colors.transparent,
+        colorScheme: ColorScheme.dark(
+          surface: Colors.transparent,
+        ),
       ),
       home: Scaffold(
         backgroundColor: Colors.transparent,
@@ -23,7 +28,7 @@ class EditorWindowApp extends StatelessWidget {
               const Text(
                 'Main Window',
                 style: TextStyle(
-                  color: Color(0xFF1A1A2E),
+                  color: Colors.white70,
                   fontSize: 20,
                   fontWeight: FontWeight.w500,
                   letterSpacing: 0.3,
