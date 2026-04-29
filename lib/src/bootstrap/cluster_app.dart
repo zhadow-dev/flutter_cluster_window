@@ -21,6 +21,22 @@ const _nativeCh = MethodChannel('flutter_cluster_window');
 /// until after the parent has positioned the window via `setWindowPos`.
 Completer<void>? _parentReadyCompleter;
 
+/// Maps [BackdropType] to [acrylic.WindowEffect] for the primary window.
+acrylic.WindowEffect _mapBackdropToWindowEffect(BackdropType backdrop) {
+  switch (backdrop) {
+    case BackdropType.acrylic:
+      return acrylic.WindowEffect.acrylic;
+    case BackdropType.mica:
+      return acrylic.WindowEffect.mica;
+    case BackdropType.tabbed:
+      return acrylic.WindowEffect.tabbed;
+    case BackdropType.transparent:
+      return acrylic.WindowEffect.transparent;
+    case BackdropType.none:
+      return acrylic.WindowEffect.disabled;
+  }
+}
+
 /// Bootstrap entry point that routes `main()` to the correct window.
 ///
 /// Determines whether the current process is the primary window or a child
@@ -95,14 +111,22 @@ class ClusterApp {
     final primaryHwnd = await _nativeCh.invokeMethod<int>('getWindowHwnd') ?? 0;
     debugPrint('[Cluster] Primary HWND=$primaryHwnd');
 
-    // Apply backdrop effect on primary window via native DWM.
-    if (primary.visual.backdrop != BackdropType.none && primaryHwnd != 0) {
+    // Apply backdrop effect on primary window via flutter_acrylic.
+    // flutter_acrylic handles the full composition pipeline for the
+    // primary window's Flutter engine view:
+    //   - Makes rendering surface transparent
+    //   - Extends DWM frame into client area
+    //   - Sets WS_EX_LAYERED for composition
+    //   - Applies DWMWA_SYSTEMBACKDROP_TYPE
+    // Child windows use our native setDwmEffect instead.
+    if (primary.visual.backdrop != BackdropType.none) {
       try {
-        await _nativeCh.invokeMethod('setDwmEffect', {
-          'handle': primaryHwnd,
-          'effect': primary.visual.backdrop.name,
-        });
-        debugPrint('[Cluster] Primary backdrop: ${primary.visual.backdrop.name}');
+        final effect = _mapBackdropToWindowEffect(primary.visual.backdrop);
+        await acrylic.Window.setEffect(
+          effect: effect,
+          dark: true,
+        );
+        debugPrint('[Cluster] Primary backdrop: ${primary.visual.backdrop.name} (via flutter_acrylic)');
       } catch (e) {
         debugPrint('[Cluster] Primary backdrop failed: $e');
       }
@@ -616,6 +640,23 @@ class ClusterApp {
         }
         return null;
       });
+    }
+
+    // Apply acrylic effect from within the child's engine context.
+    // Each child window has its own Flutter engine — flutter_acrylic's
+    // Window.setEffect() must be called here (not from the parent) to
+    // make THIS engine's rendering surface transparent.
+    if (surface.visual.backdrop != BackdropType.none) {
+      try {
+        final effect = _mapBackdropToWindowEffect(surface.visual.backdrop);
+        await acrylic.Window.setEffect(
+          effect: effect,
+          dark: true,
+        );
+        debugPrint('[Cluster] Child ${surface.id} backdrop: ${surface.visual.backdrop.name} (via flutter_acrylic)');
+      } catch (e) {
+        debugPrint('[Cluster] Child ${surface.id} backdrop failed: $e');
+      }
     }
 
     // Build the widget tree, optionally wrapping with shrink-to-content.

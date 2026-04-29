@@ -378,8 +378,12 @@ void FlutterClusterWindowPlugin::HandleMethodCall(
         }
         result->Success(flutter::EncodableValue(list));
     } else if (method == "setDwmEffect") {
-        // Apply DWM backdrop effect directly (works without flutter_acrylic).
-        // effect: "acrylic", "mica", "transparent", "solid", "none"
+        // Apply DWM backdrop effect with full composition pipeline.
+        // Three requirements for acrylic to work:
+        //   1. Window allows transparency (WS_EX_LAYERED or composition)
+        //   2. Frame extended into client area (DwmExtendFrameIntoClientArea)
+        //   3. DWM backdrop type set (DWMWA_SYSTEMBACKDROP_TYPE)
+        // effect: "acrylic", "mica", "tabbed", "transparent", "solid", "none"
         if (args && std::holds_alternative<flutter::EncodableMap>(*args)) {
             auto& map = std::get<flutter::EncodableMap>(*args);
             HWND hwnd = HwndFromHandle(map);
@@ -396,20 +400,28 @@ void FlutterClusterWindowPlugin::HandleMethodCall(
             #define DWMWA_SYSTEMBACKDROP_TYPE 38
             #endif
 
-            // Enable dark mode for DWM.
+            // Step 1: Enable dark mode for DWM chrome.
             BOOL darkMode = TRUE;
             DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
                 &darkMode, sizeof(darkMode));
 
-            // Enable extending frame into client area (required for backdrop).
+            // Step 2: Extend frame into client area (required for blur).
             MARGINS margins = { -1, -1, -1, -1 };
             DwmExtendFrameIntoClientArea(hwnd, &margins);
 
+            // Step 3: Make window surface transparent for composition.
+            // Without this, the window surface is opaque and acrylic
+            // renders as black.
+            LONG exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+            SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
+            SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+
+            // Step 4: Set DWM backdrop type.
             int backdropType = 0; // Auto
             if (effectType == "mica") backdropType = 2;
             else if (effectType == "acrylic") backdropType = 3;
             else if (effectType == "tabbed") backdropType = 4;
-            else if (effectType == "transparent") backdropType = 3;
+            else if (effectType == "transparent") backdropType = 0;
             else if (effectType == "solid") backdropType = 1;
             else if (effectType == "none") backdropType = 1;
 
@@ -419,7 +431,6 @@ void FlutterClusterWindowPlugin::HandleMethodCall(
             if (SUCCEEDED(hr)) {
                 result->Success(flutter::EncodableValue(true));
             } else {
-                // Fallback for older Win11: try DWMWA_USE_IMMERSIVE_DARK_MODE only
                 result->Success(flutter::EncodableValue(false));
             }
         } else {
