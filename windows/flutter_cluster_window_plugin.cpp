@@ -379,11 +379,8 @@ void FlutterClusterWindowPlugin::HandleMethodCall(
         result->Success(flutter::EncodableValue(list));
     } else if (method == "setDwmEffect") {
         // Apply DWM backdrop effect with full composition pipeline.
-        // Three requirements for acrylic to work:
-        //   1. Window allows transparency (WS_EX_LAYERED or composition)
-        //   2. Frame extended into client area (DwmExtendFrameIntoClientArea)
-        //   3. DWM backdrop type set (DWMWA_SYSTEMBACKDROP_TYPE)
-        // effect: "acrylic", "mica", "tabbed", "transparent", "solid", "none"
+        // Used ONLY for the primary window. Child windows use
+        // prepareChildComposition instead.
         if (args && std::holds_alternative<flutter::EncodableMap>(*args)) {
             auto& map = std::get<flutter::EncodableMap>(*args);
             HWND hwnd = HwndFromHandle(map);
@@ -394,30 +391,18 @@ void FlutterClusterWindowPlugin::HandleMethodCall(
                 return;
             }
 
-            // DWM_SYSTEMBACKDROP_TYPE (Win11 22H2+)
-            // 0 = Auto, 1 = None, 2 = Mica, 3 = Acrylic, 4 = Tabbed
             #ifndef DWMWA_SYSTEMBACKDROP_TYPE
             #define DWMWA_SYSTEMBACKDROP_TYPE 38
             #endif
 
-            // Step 1: Enable dark mode for DWM chrome.
             BOOL darkMode = TRUE;
             DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
                 &darkMode, sizeof(darkMode));
 
-            // Step 2: Extend frame into client area (required for blur).
             MARGINS margins = { -1, -1, -1, -1 };
             DwmExtendFrameIntoClientArea(hwnd, &margins);
 
-            // Step 3: Make window surface transparent for composition.
-            // Without this, the window surface is opaque and acrylic
-            // renders as black.
-            LONG exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
-            SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_LAYERED);
-            SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
-
-            // Step 4: Set DWM backdrop type.
-            int backdropType = 0; // Auto
+            int backdropType = 0;
             if (effectType == "mica") backdropType = 2;
             else if (effectType == "acrylic") backdropType = 3;
             else if (effectType == "tabbed") backdropType = 4;
@@ -428,14 +413,104 @@ void FlutterClusterWindowPlugin::HandleMethodCall(
             HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
                 &backdropType, sizeof(backdropType));
 
-            if (SUCCEEDED(hr)) {
-                result->Success(flutter::EncodableValue(true));
-            } else {
-                result->Success(flutter::EncodableValue(false));
-            }
+            SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+            result->Success(flutter::EncodableValue(SUCCEEDED(hr)));
         } else {
             result->Error("INVALID_ARGS", "Expected EncodableMap");
         }
+
+    } else if (method == "prepareChildComposition") {
+        // Atomic child window composition setup.
+        // Degrades a child HWND into a "non-visual participant" (no shadow,
+        // no depth cues, no taskbar presence) while PRESERVING DWM acrylic
+        // composition.
+        //
+        // Order matters — everything must happen before ShowWindow:
+        //   1. Kill shadow at source (class style + NCRENDERING)
+        //   2. Tool window style (no taskbar, no shadow)
+        //   3. Composition: layered + frame extension
+        //   4. Backdrop type
+        //   5. No rounded corners (match primary)
+        //   6. Force SWP_FRAMECHANGED
+        if (args && std::holds_alternative<flutter::EncodableMap>(*args)) {
+            auto& map = std::get<flutter::EncodableMap>(*args);
+            HWND hwnd = HwndFromHandle(map);
+            auto effectType = GetString(map, "effect");
+            auto cornerPrefStr = GetString(map, "cornerPreference");
+
+            if (!IsWindow(hwnd)) {
+                result->Error("INVALID_HANDLE", "Invalid HWND");
+                return;
+            }
+
+            #ifndef DWMWA_SYSTEMBACKDROP_TYPE
+            #define DWMWA_SYSTEMBACKDROP_TYPE 38
+            #endif
+            #ifndef DWMWA_NCRENDERING_POLICY
+            #define DWMWA_NCRENDERING_POLICY 2
+            #endif
+            #ifndef DWMWA_WINDOW_CORNER_PREFERENCE
+            #define DWMWA_WINDOW_CORNER_PREFERENCE 33
+            #endif
+
+            // ── Step 1: Kill shadow at source ──
+            // Remove CS_DROPSHADOW from class style.
+            ULONG_PTR classStyle = GetClassLongPtr(hwnd, GCL_STYLE);
+            SetClassLongPtr(hwnd, GCL_STYLE, classStyle & ~CS_DROPSHADOW);
+
+            // Disable DWM non-client rendering (shadow, border chrome).
+            // This does NOT affect the client-area backdrop (acrylic/mica).
+            int ncrp = 1; // DWMNCRP_DISABLED
+            DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY,
+                &ncrp, sizeof(ncrp));
+
+            // ── Step 2: Window styles ──
+            // WS_EX_TOOLWINDOW: no taskbar, helps prevent shadow.
+            // WS_EX_LAYERED: required for transparent composition.
+            LONG exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
+            exStyle |= WS_EX_TOOLWINDOW | WS_EX_LAYERED;
+            SetWindowLong(hwnd, GWL_EXSTYLE, exStyle);
+            SetLayeredWindowAttributes(hwnd, 0, 255, LWA_ALPHA);
+
+            // ── Step 3: DWM composition ──
+            // Dark mode for DWM.
+            BOOL darkMode = TRUE;
+            DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE,
+                &darkMode, sizeof(darkMode));
+
+            // Extend frame into entire client area — required for blur.
+            MARGINS margins = { -1, -1, -1, -1 };
+            DwmExtendFrameIntoClientArea(hwnd, &margins);
+
+            // ── Step 4: Backdrop type ──
+            int backdropType = 0;
+            if (effectType == "mica") backdropType = 2;
+            else if (effectType == "acrylic") backdropType = 3;
+            else if (effectType == "tabbed") backdropType = 4;
+            else if (effectType == "solid") backdropType = 1;
+            else if (effectType == "none") backdropType = 1;
+
+            DwmSetWindowAttribute(hwnd, DWMWA_SYSTEMBACKDROP_TYPE,
+                &backdropType, sizeof(backdropType));
+
+            // ── Step 5: Corner preference ──
+            int cornerPref = 1; // DWMWCP_DONOTROUND (match primary, no seams)
+            if (cornerPrefStr == "round") cornerPref = 2;
+            else if (cornerPrefStr == "roundSmall") cornerPref = 3;
+            DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE,
+                &cornerPref, sizeof(cornerPref));
+
+            // ── Step 6: Force DWM recompute ──
+            SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+            result->Success(flutter::EncodableValue(true));
+        } else {
+            result->Error("INVALID_ARGS", "Expected EncodableMap");
+        }
+
     } else if (method == "setCornerPreference") {
         // Set window corner rounding (Win11 22H2+).
         // DWMWA_WINDOW_CORNER_PREFERENCE = 33
@@ -461,39 +536,46 @@ void FlutterClusterWindowPlugin::HandleMethodCall(
         }
     } else if (method == "removeShadow") {
         // Remove drop shadow from a window.
-        // Strips the CS_DROPSHADOW class style and disables DWM non-client
-        // rendering so no shadow is painted around the window frame.
+        // When 'preserveMargins' is true (surface has a backdrop effect),
+        // we only strip the class-level shadow flag without touching DWM
+        // margins or non-client rendering — those are needed for acrylic.
         if (args && std::holds_alternative<flutter::EncodableMap>(*args)) {
             auto& map = std::get<flutter::EncodableMap>(*args);
             HWND hwnd = HwndFromHandle(map);
+
+            // Check if we should preserve DWM composition (for acrylic).
+            bool preserveMargins = false;
+            auto pmIt = map.find(flutter::EncodableValue("preserveMargins"));
+            if (pmIt != map.end() && std::holds_alternative<bool>(pmIt->second)) {
+                preserveMargins = std::get<bool>(pmIt->second);
+            }
+
             if (IsWindow(hwnd)) {
                 // Remove CS_DROPSHADOW from the window class style.
                 ULONG_PTR classStyle = GetClassLongPtr(hwnd, GCL_STYLE);
                 SetClassLongPtr(hwnd, GCL_STYLE, classStyle & ~CS_DROPSHADOW);
 
-                // Disable DWM non-client rendering (removes DWM shadow).
-                #ifndef DWMWA_NCRENDERING_POLICY
-                #define DWMWA_NCRENDERING_POLICY 2
-                #endif
-                int ncrp = 1; // DWMNCRP_DISABLED
-                DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY,
-                    &ncrp, sizeof(ncrp));
+                if (!preserveMargins) {
+                    // No backdrop — safe to disable DWM non-client rendering
+                    // and reset margins.
+                    #ifndef DWMWA_NCRENDERING_POLICY
+                    #define DWMWA_NCRENDERING_POLICY 2
+                    #endif
+                    int ncrp = 1; // DWMNCRP_DISABLED
+                    DwmSetWindowAttribute(hwnd, DWMWA_NCRENDERING_POLICY,
+                        &ncrp, sizeof(ncrp));
 
-                // Reset DWM extended frame margins to zero.
-                // setDwmEffect sets {-1,-1,-1,-1} which creates a shadow;
-                // resetting to {0,0,0,0} removes it.  The backdrop type
-                // (DWMWA_SYSTEMBACKDROP_TYPE) still works independently
-                // on Windows 11 22H2+.
-                MARGINS margins = {0, 0, 0, 0};
-                DwmExtendFrameIntoClientArea(hwnd, &margins);
+                    MARGINS margins = {0, 0, 0, 0};
+                    DwmExtendFrameIntoClientArea(hwnd, &margins);
+                }
+                // else: preserve {-1,-1,-1,-1} margins for acrylic/mica
 
-                // Defence-in-depth: also set WS_EX_TOOLWINDOW which
-                // prevents the OS from adding a shadow to this window.
+                // WS_EX_TOOLWINDOW prevents OS from adding shadow.
                 LONG exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
                 exStyle |= WS_EX_TOOLWINDOW;
                 SetWindowLong(hwnd, GWL_EXSTYLE, exStyle);
 
-                // Force the frame to repaint without shadow.
+                // Force the frame to repaint.
                 SetWindowPos(hwnd, nullptr, 0, 0, 0, 0,
                     SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
                     SWP_NOZORDER | SWP_NOACTIVATE);

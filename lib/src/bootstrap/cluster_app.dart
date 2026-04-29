@@ -277,10 +277,16 @@ class ClusterApp {
       }
       debugPrint('[Cluster] ${child.id} → HWND=$hwnd bounds=$bounds');
 
+      // ── Phase 1: Frameless + Owner (structural, before composition) ──
       if (child.frameless) {
         await _nativeCh.invokeMethod('setFrameless', {'handle': hwnd});
       }
+      await _nativeCh.invokeMethod('setOwner', {
+        'handle': hwnd,
+        'ownerHandle': primaryHwnd,
+      });
 
+      // ── Phase 2: Position ──
       await _nativeCh.invokeMethod('setWindowPos', {
         'handle': hwnd,
         'frame': {
@@ -291,50 +297,28 @@ class ClusterApp {
         },
       });
 
-      // Hide from Alt+Tab.
-      await _nativeCh.invokeMethod('setToolWindow', {'handle': hwnd});
-
-      // Owner relationship enables z-order grouping and cascading minimize.
-      await _nativeCh.invokeMethod('setOwner', {
-        'handle': hwnd,
-        'ownerHandle': primaryHwnd,
-      });
-
-      controllers[child.id]!.show();
-
-      // Apply backdrop effect via native DWM.
-      if (child.visual.backdrop != BackdropType.none) {
-        try {
-          await _nativeCh.invokeMethod('setDwmEffect', {
-            'handle': hwnd,
-            'effect': child.visual.backdrop.name,
-          });
-          debugPrint('[Cluster][backdrop] ${child.visual.backdrop.name} → ${child.id}');
-        } catch (e) {
-          debugPrint('[Cluster][backdrop] Failed for ${child.id}: $e');
-        }
-      }
-
-      // Apply corner style.
+      // ── Phase 3: Atomic composition setup (before show) ──
+      // Single native call does ALL of:
+      //   - Kill shadow (CS_DROPSHADOW, DWMNCRP_DISABLED)
+      //   - Tool window style (WS_EX_TOOLWINDOW)
+      //   - Layered composition (WS_EX_LAYERED)
+      //   - Frame extension ({-1,-1,-1,-1})
+      //   - Backdrop type (acrylic/mica/etc)
+      //   - Corner preference
+      //   - SWP_FRAMECHANGED refresh
       try {
-        await _nativeCh.invokeMethod('setCornerPreference', {
+        await _nativeCh.invokeMethod('prepareChildComposition', {
           'handle': hwnd,
-          'preference': child.visual.cornerStyle.name,
+          'effect': child.visual.backdrop.name,
+          'cornerPreference': child.visual.cornerStyle.name,
         });
-      } catch (_) {}
-
-      // Shadow enforcement: only the shadow owner keeps its shadow.
-      // All other cluster surfaces have shadow forcefully removed.
-      // This is called AFTER DWM effect so the margin reset overrides
-      // the {-1,-1,-1,-1} margins that setDwmEffect applies.
-      if (child.id != config.shadowOwnerId) {
-        try {
-          await _nativeCh.invokeMethod('removeShadow', {'handle': hwnd});
-          debugPrint('[Cluster][shadow] Removed from ${child.id}');
-        } catch (e) {
-          debugPrint('[Cluster][shadow] Failed for ${child.id}: $e');
-        }
+        debugPrint('[Cluster][composition] ${child.id} prepared (${child.visual.backdrop.name})');
+      } catch (e) {
+        debugPrint('[Cluster][composition] Failed for ${child.id}: $e');
       }
+
+      // ── Phase 4: Show ──
+      controllers[child.id]!.show();
 
       try {
         await controllers[child.id]!.invokeMethod('parentReady');
@@ -351,8 +335,12 @@ class ClusterApp {
       }
       // Overlay shadow: controlled by config, not per-surface.
       if (!config.allowOverlayShadow) {
+        final hasBackdrop = child.visual.backdrop != BackdropType.none;
         try {
-          await _nativeCh.invokeMethod('removeShadow', {'handle': hwnd});
+          await _nativeCh.invokeMethod('removeShadow', {
+            'handle': hwnd,
+            'preserveMargins': hasBackdrop,
+          });
         } catch (_) {}
       }
       await _nativeCh.invokeMethod('setToolWindow', {'handle': hwnd});
@@ -746,7 +734,11 @@ class ClusterApp {
           final hwnd = hwnds[overlay.id];
           if (hwnd == null || _shadowDisabledHandles.contains(hwnd)) continue;
           try {
-            await _nativeCh.invokeMethod('removeShadow', {'handle': hwnd});
+            final hasBackdrop = overlay.visual.backdrop != BackdropType.none;
+            await _nativeCh.invokeMethod('removeShadow', {
+              'handle': hwnd,
+              'preserveMargins': hasBackdrop,
+            });
             _shadowDisabledHandles.add(hwnd);
             debugPrint('[Cluster][v$v][shadow] Overlay ${overlay.id} removed');
           } catch (e) {
@@ -821,11 +813,10 @@ class ClusterApp {
       final hwnd = hwnds[child.id];
       if (hwnd == null || _shadowDisabledHandles.contains(hwnd)) continue;
 
-      try {
-        await _nativeCh.invokeMethod('removeShadow', {'handle': hwnd});
-        _shadowDisabledHandles.add(hwnd);
-        debugPrint('[Cluster][v$version][shadow] Enforced on ${child.id}');
-      } catch (_) {}
+      // Shadow was already killed at source by prepareChildComposition.
+      // Just mark as disabled in cache — no native call needed.
+      _shadowDisabledHandles.add(hwnd);
+      debugPrint('[Cluster][v$version][shadow] Cached ${child.id}');
     }
   }
 }
