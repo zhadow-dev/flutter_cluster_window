@@ -297,22 +297,15 @@ class ClusterApp {
         },
       });
 
-      // ── Phase 3: Atomic composition setup (before show) ──
-      // Single native call does ALL of:
-      //   - Kill shadow (CS_DROPSHADOW, DWMNCRP_DISABLED)
-      //   - Tool window style (WS_EX_TOOLWINDOW)
-      //   - Layered composition (WS_EX_LAYERED)
-      //   - Frame extension ({-1,-1,-1,-1})
-      //   - Backdrop type (acrylic/mica/etc)
-      //   - Corner preference
-      //   - SWP_FRAMECHANGED refresh
+      // ── Phase 3: Degrade to flat surface (before show) ──
+      // Kills shadow at source, sets tool window, no rounded corners.
+      // DWM backdrop (acrylic/mica) is handled by flutter_acrylic's
+      // Window.setEffect() called from within each child's engine.
       try {
         await _nativeCh.invokeMethod('prepareChildComposition', {
           'handle': hwnd,
-          'effect': child.visual.backdrop.name,
-          'cornerPreference': child.visual.cornerStyle.name,
         });
-        debugPrint('[Cluster][composition] ${child.id} prepared (${child.visual.backdrop.name})');
+        debugPrint('[Cluster][composition] ${child.id} degraded to flat surface');
       } catch (e) {
         debugPrint('[Cluster][composition] Failed for ${child.id}: $e');
       }
